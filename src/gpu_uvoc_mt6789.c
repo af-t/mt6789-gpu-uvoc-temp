@@ -11,30 +11,37 @@
 #define ENTRY_U32 6
 #define UV_OFFSET 1250 // -12.5mV mid-stack, hardcoded (no module_param)
 
-// GED BSS offsets (ged.ko from vendor_dlkm, Wild 6.12.38): g_working_table
-// is a boot-time kmalloc copy of the working table that ged_get_freq_by_idx
-// (hence /sys/kernel/ged/hal/current_freqency) reads instead of the live
-// table. Entries are validated against the stock backup before patching, so
-// a ged.ko update that moves these offsets fails safe (GED sync skipped,
-// working patch kept).
-#define GED_BSS_WORKING_OFF 0x9c80
-#define GED_BSS_TOP_OFF 0x9c88
-// Signed table (g_gpu in mtk_gpufreq_mt6789.ko, .bss+0x0): golden table that
-// __gpufreq_freq_scale_gpu scans live for posdiv selection, and what
-// /proc/gpufreqv2/gpu_signed_opp_table displays. Same validate pattern;
-// gpufreq_get_signed_table is NOT exported so direct import fails.
-// NOTE: GKI trims filp_open and protects kernel_read on this kernel, so the
-// BSS bases cannot be resolved from inside the module. Pass them from the
-// root shell, e.g.:
-//   insmod gpu_uvoc.ko ged_bss=$(cat /sys/module/ged/sections/.bss) \
-//     mt6789_bss=$(cat /sys/module/mtk_gpufreq_mt6789/sections/.bss)
+// Target 5.10.252 vendor modules: GED stores g_working_table and
+// g_virtual_table pointers at .bss+0x18 and .bss+0x70. The signed GPU table
+// pointer in mtk_gpufreq_mt6789.ko is at .bss+0x108. These offsets are checked
+// against the target module layouts before any pointer is dereferenced.
+#define GED_BSS_WORKING_OFF 0x18
+#define GED_BSS_TOP_OFF 0x70
+#define GED_BSS_SIZE 0x19244
+#define SIGNED_BSS_GPU_OFF 0x108
+#define SIGNED_BSS_SIZE 0x5d0
+#define SYNC_TARGET_510 5313106UL
+// GKI trims filp_open and protects kernel_read on this kernel, so the BSS bases
+// cannot be resolved from inside the module. The root helper passes the live
+// bases, exact BSS sizes, and the target sync token:
+//   insmod gpu_uvoc.ko sync_target=5313106 \
+//     ged_bss=$(cat /sys/module/ged/sections/.bss) ged_bss_size=102980 \
+//     mt6789_bss=$(cat /sys/module/mtk_gpufreq_mt6789/sections/.bss) mt6789_bss_size=1488
+static unsigned long sync_target;
+module_param(sync_target, ulong, 0444);
+MODULE_PARM_DESC(sync_target, "full-sync target token (5313106 = Kagami 5.10.252)");
+static unsigned int ged_bss_size;
+module_param(ged_bss_size, uint, 0444);
+MODULE_PARM_DESC(ged_bss_size, "expected .bss size of target ged.ko");
+static unsigned int mt6789_bss_size;
+module_param(mt6789_bss_size, uint, 0444);
+MODULE_PARM_DESC(mt6789_bss_size, "expected .bss size of target mtk_gpufreq_mt6789.ko");
 static unsigned long ged_bss;
 module_param(ged_bss, ulong, 0444);
 MODULE_PARM_DESC(ged_bss, "runtime .bss base of ged.ko (0 = skip GED sync)");
 static unsigned long mt6789_bss;
 module_param(mt6789_bss, ulong, 0444);
 MODULE_PARM_DESC(mt6789_bss, "runtime .bss base of mtk_gpufreq_mt6789.ko (0 = skip signed sync)");
-#define SIGNED_BSS_GPU_OFF 0x0
 
 // Official getters from mtk_gpufreq_wrapper_legacy.ko (EXPORT_SYMBOL, no crc
 // under GKI basic-modversions so version-independent). type 1 = GPU.
@@ -193,8 +200,21 @@ static void ged_sync_tables(void)
   u32 *g, *gtop;
   int i, j;
 
+  if (sync_target != SYNC_TARGET_510) {
+    pr_info("[gpu-uvoc] GED sync disabled: pass sync_target=%lu\n", SYNC_TARGET_510);
+    return;
+  }
+  if (ged_bss_size != GED_BSS_SIZE) {
+    pr_info("[gpu-uvoc] GED sync disabled: ged_bss_size=%u, expected %u\n",
+            ged_bss_size, GED_BSS_SIZE);
+    return;
+  }
   if (!ged_bss) {
     pr_info("[gpu-uvoc] GED sync skipped: pass ged_bss=$(cat /sys/module/ged/sections/.bss)\n");
+    return;
+  }
+  if ((ged_bss & (sizeof(void *) - 1)) != 0) {
+    pr_info("[gpu-uvoc] GED sync skipped: unaligned .bss base\n");
     return;
   }
   ged_bss_live = ged_bss;
@@ -230,8 +250,21 @@ static void signed_sync_table(void)
   u32 *s;
   int i, j;
 
+  if (sync_target != SYNC_TARGET_510) {
+    pr_info("[gpu-uvoc] signed sync disabled: pass sync_target=%lu\n", SYNC_TARGET_510);
+    return;
+  }
+  if (mt6789_bss_size != SIGNED_BSS_SIZE) {
+    pr_info("[gpu-uvoc] signed sync disabled: mt6789_bss_size=%u, expected %u\n",
+            mt6789_bss_size, SIGNED_BSS_SIZE);
+    return;
+  }
   if (!mt6789_bss) {
     pr_info("[gpu-uvoc] signed sync skipped: pass mt6789_bss=$(cat /sys/module/mtk_gpufreq_mt6789/sections/.bss)\n");
+    return;
+  }
+  if ((mt6789_bss & (sizeof(void *) - 1)) != 0) {
+    pr_info("[gpu-uvoc] signed sync skipped: unaligned .bss base\n");
     return;
   }
   mt6789_bss_live = mt6789_bss;
