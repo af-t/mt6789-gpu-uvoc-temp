@@ -102,6 +102,23 @@ static int __init uvoc_init(void)
     return -ENOENT;
   }
   tbl_addr = t;
+  // Fail-safe: refuse foreign or already-patched tables instead of
+  // compounding. Stock freq anchors never move with AVS/aging (golden:
+  // idx0 1100000, idx44 390000); vsram floor is 75000 everywhere. A later
+  // re-probe of mtk_gpufreq reads back the regulators and aborts (panics)
+  // on vsram below the floor, so never let such state through here.
+  if (t[0] != 1100000 || t[(OPP_NUM - 1) * ENTRY_U32] != 390000) {
+    pr_err("[gpu-uvoc] table anchors idx0=%u idx44=%u, want 1100000/390000 (already patched?), abort\n",
+           t[0], t[(OPP_NUM - 1) * ENTRY_U32]);
+    return -EINVAL;
+  }
+  for (i = 0; i < OPP_NUM; i++) {
+    u32 s = t[i * ENTRY_U32 + 2];
+    if (s < 75000 || s > 129696) {
+      pr_err("[gpu-uvoc] live vsram idx%d=%u outside [75000,129696], abort\n", i, s);
+      return -EINVAL;
+    }
+  }
   for (i = 0; i < OPP_NUM; i++) { // manual backup, avoid importing memcpy
     int j;
     for (j = 0; j < ENTRY_U32; j++)

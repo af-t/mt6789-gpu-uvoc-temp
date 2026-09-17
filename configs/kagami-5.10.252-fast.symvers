@@ -1,0 +1,6 @@
+0x7c24b32d	module_layout	vmlinux	EXPORT_SYMBOL	
+0xc5850110	printk	vmlinux	EXPORT_SYMBOL	
+0x021d6537	param_ops_ulong	vmlinux	EXPORT_SYMBOL	
+0x4829a47e	memcpy	vmlinux	EXPORT_SYMBOL	
+0x6a67ffb2	gpufreq_get_working_table	mtk_gpufreq_wrapper	EXPORT_SYMBOL	
+0x484164d5	gpufreq_get_opp_num	mtk_gpufreq_wrapper	EXPORT_SYMBOL	

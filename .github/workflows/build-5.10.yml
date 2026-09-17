@@ -1,0 +1,64 @@
+name: Build LKM (GKI 5.10.252 android12-5.10-2026-04)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        freq: [1200, 1250, 1300, 1350, 1400, 1450, 1500, 1550, 1600, 1650, 1700, 1750, 1800, 1850, 1900]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev libelf-dev libdwarf-dev \
+            dwarves clang lld llvm git make gcc-aarch64-linux-gnu
+
+      - name: Clone GKI common (android12-5.10-2026-04 = 5.10.252)
+        run: |
+          git clone --depth 1 -b android12-5.10-2026-04 \
+            https://android.googlesource.com/kernel/common kernel-common
+          cd kernel-common
+          git log --oneline -1
+          head -5 Makefile
+
+      - name: Prepare kernel build dir
+        run: |
+          cd kernel-common
+          # 5.10 does not infer the clang target from ARCH like 6.12 does;
+          # without CLANG_TRIPLE the host clang targets x86_64 and dies with
+          # "unknown register name 'x0' in asm".
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          make ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
+          # Best-effort tweaks; options may not exist on 5.10, so never fail here.
+          ./scripts/config --enable CONFIG_CFI_ICALL_NORMALIZE_INTEGERS || true
+          ./scripts/config --disable CONFIG_GENDWARFKSYMS || true
+          make ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
+          make ARCH=arm64 LLVM=1 LLVM_IAS=1 -j$(nproc) modules_prepare
+
+      - name: Build module
+        run: |
+          python3 tools/gen_opp.py ${{ matrix.freq }} > src/opp_table.h
+          make -C kernel-common ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- M=$GITHUB_WORKSPACE \
+            KBUILD_EXTRA_SYMBOLS=$GITHUB_WORKSPACE/Extra.symvers KBUILD_MODPOST_WARN=1 modules
+          llvm-strip --strip-debug src/gpu_uvoc_mt6789.ko || true
+          ls -lh src/*.ko
+          file src/*.ko
+          modinfo src/gpu_uvoc_mt6789.ko || true
+          modinfo src/gpu_uvoc_mt6789.ko | grep -E "5\.10\.252" || { echo "vermagic is not 5.10.252, wrong tree?"; exit 1; }
+          # 5.10 emits U printk; 5.11+ emits U _printk. Allow both.
+          undef=$(nm src/gpu_uvoc_mt6789.ko | grep " U " | grep -v -E " (_printk|printk|_fortify_panic)|gpufreq_get_(working_table|opp_num)|param_ops_ulong|module_layout" || true)
+          [ -z "$undef" ] || { echo "foreign undef: $undef"; exit 1; }
+          mkdir -p dist
+          mv src/gpu_uvoc_mt6789.ko dist/gpu_uvoc_mt6789_${{ matrix.freq }}.ko
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gpu_uvoc_mt6789-${{ matrix.freq }}-5.10.252-android12-2026-04
+          path: dist/gpu_uvoc_mt6789_${{ matrix.freq }}.ko

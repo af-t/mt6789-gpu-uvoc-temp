@@ -1,0 +1,88 @@
+name: Build LKM (KagamiChihiro 5.10.252 fast)
+
+# Fast path: prepare headers only, then use the target kernel's symbol CRCs.
+# The CRC file is extracted from the modules currently loaded on the target
+# (plus the target's param_ops_ulong CRC verified by the full build).
+# This avoids the 20-minute full kernel build for every variant run.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev libelf-dev libdwarf-dev \
+            dwarves clang lld llvm git make gcc-aarch64-linux-gnu
+
+      - name: Clone GKI common (android12-5.10-2026-04 = 5.10.252)
+        run: |
+          git clone --depth 1 -b android12-5.10-2026-04 \
+            https://android.googlesource.com/kernel/common kernel-common
+          cd kernel-common
+          git log --oneline -1
+          head -5 Makefile
+
+      - name: Prepare kernel headers (target config)
+        run: |
+          cd kernel-common
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export LOCALVERSION=+
+          cp $GITHUB_WORKSPACE/configs/kagami-5.10.252.config .config
+          : > $GITHUB_WORKSPACE/abi_whitelist.empty
+          ./scripts/config --set-str CONFIG_UNUSED_KSYMS_WHITELIST $GITHUB_WORKSPACE/abi_whitelist.empty
+          ./scripts/config --disable CONFIG_TRIM_UNUSED_KSYMS
+          ./scripts/config --disable CONFIG_PREEMPT_NONE --disable CONFIG_PREEMPT_VOLUNTARY --enable CONFIG_PREEMPT
+          make ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
+          grep -q "^CONFIG_PREEMPT=y" .config || { echo "full PREEMPT lost"; exit 1; }
+          make ARCH=arm64 LLVM=1 LLVM_IAS=1 -j$(nproc) modules_prepare
+          cat include/generated/utsrelease.h
+
+      - name: Build all 15 variants
+        run: |
+          mkdir -p dist
+          for f in 1200 1250 1300 1350 1400 1450 1500 1550 1600 1650 1700 1750 1800 1850 1900; do
+            python3 tools/gen_opp.py $f > src/opp_table.h
+            make -s -C kernel-common ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+              CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- \
+              LOCALVERSION=+ M=$GITHUB_WORKSPACE \
+              KBUILD_EXTRA_SYMBOLS=$GITHUB_WORKSPACE/configs/kagami-5.10.252-fast.symvers \
+              KBUILD_MODPOST_WARN=1 modules
+            llvm-strip --strip-debug src/gpu_uvoc_mt6789.ko || true
+            modinfo src/gpu_uvoc_mt6789.ko | grep -F "5.10.252-KagamiChihiro-v2.0-MillenniumTeam+ SMP preempt mod_unload modversions aarch64" \
+              || { echo "variant $f: vermagic mismatch"; modinfo src/gpu_uvoc_mt6789.ko | grep vermagic; exit 1; }
+            undef=$(nm src/gpu_uvoc_mt6789.ko | grep " U " | grep -v -E " (_printk|printk|memcpy|_fortify_panic)|gpufreq_get_(working_table|opp_num)|param_ops_ulong|module_layout" || true)
+            [ -z "$undef" ] || { echo "variant $f foreign undef: $undef"; exit 1; }
+            python3 -c "
+          import struct,subprocess,re
+          f='src/gpu_uvoc_mt6789.ko'
+          out=subprocess.run(['readelf','-SW',f],capture_output=True,text=True).stdout
+          m=re.search(r'__versions\s+\w+\s+[0-9a-f]+\s+([0-9a-f]+)\s+([0-9a-f]+)',out)
+          assert m, 'no __versions section'
+          off,sz=int(m.group(1),16),int(m.group(2),16)
+          data=open(f,'rb').read()[off:off+sz]
+          got={}; i=0
+          while i+64<=len(data):
+              crc=struct.unpack_from('<Q',data,i)[0]
+              got[data[i+8:i+64].split(b'\x00')[0].decode()]=crc; i+=64
+          need=['module_layout','printk','param_ops_ulong','memcpy','gpufreq_get_working_table','gpufreq_get_opp_num']
+          missing=[s for s in need if s not in got]
+          print(got)
+          assert not missing, f'missing versions: {missing}'
+          "
+            mv src/gpu_uvoc_mt6789.ko dist/gpu_uvoc_mt6789_${f}-kagami.ko
+            echo "OK $f"
+          done
+          python3 tools/gen_opp.py 1200 > src/opp_table.h
+          ls -lh dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gpu_uvoc_mt6789-kagami-5.10.252-fast-all
+          path: dist/gpu_uvoc_mt6789_*-kagami.ko
